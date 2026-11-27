@@ -182,7 +182,7 @@ class MmuFilamentMovement:
         fine = 3. * self.encoder().min_measurable() if self.has_encoder() else self.PRELOAD_STALL_STEP
         return min(self.PRELOAD_STALL_STEP, max(self.PRELOAD_MIN_STEP, fine))
 
-    def _feed_until_stalled(self, gate, feed_limit, at_stop_ok=False):
+    def _feed_until_stalled(self, gate, feed_limit, at_stop_ok=False, further_limit=None):
         """
         Feed the selected gate in _preload_stall_step() moves until the encoder measures less than
         half a step: the strand has stopped against something (on a park_at_toolhead unit, the
@@ -193,15 +193,26 @@ class MmuFilamentMovement:
         parked: its tip is past the encoder and near the stop) no movement in the first
         PRELOAD_START_STEPS steps means it is already at the stop, and that is the stall,
         rather than grinding on.
+
+        further_limit: if the strand is still moving at feed_limit, it started further back
+        than expected (a parked strand pulled back by hand), so feed on up to this limit.
         """
         step = self._preload_stall_step()
         fed = 0.
         seen_moving = False
-        while fed < feed_limit:
+        moving = False
+        while True:
+            if fed >= feed_limit:
+                if not (moving and further_limit and further_limit > feed_limit):
+                    break
+                self.log_info("Gate %d's filament was further back than its park position, "
+                              "feeding on until it stops at the toolhead..." % gate)
+                feed_limit, further_limit = further_limit, None
             _, _, measured, _ = self.move_filament(
                 "Preload feed until stall", step, wait=True, encoder_dwell=True)
             fed += step
-            if measured >= step / 2:
+            moving = measured >= step / 2
+            if moving:
                 seen_moving = True
             elif seen_moving:
                 self.log_debug("Gate %d stalled after feeding %.1fmm" % (gate, fed))
@@ -216,6 +227,39 @@ class MmuFilamentMovement:
                            hint="Check the gear grips the filament from gate %d" % gate)
         raise MmuError("Gate %d did not stop at the toolhead within %.1fmm" % (gate, fed),
                        hint="Check the bowden length for gate %d and that the toolhead path is occupied" % gate)
+
+    PARKED_FURTHER_STEP = 50.0  # Homing step (mm) while feeding a parked strand from further back
+
+    def _home_to_toolhead_from_further(self, gate, fed, measured):
+        """
+        park_at_toolhead: a gate thought parked above the toolhead missed the toolhead sensor
+        within its homing distance. If the encoder saw the strand move freely all that way, it
+        was further back than its park position (pulled back by hand between tool changes), so
+        home on to the toolhead sensor in PARKED_FURTHER_STEP gear moves, each of which must
+        show movement, up to the whole bowden. A strand that didn't move is stuck, not further
+        back, and gets no further feed.
+
+        Returns (distance fed, homed).
+        """
+        u = self.mmu_unit()
+        if not (u.p.park_at_toolhead and gate >= 0 and self.has_encoder()) or measured < fed / 2:
+            return 0., False
+        limit = u.calibrator.get_bowden_length() * 1.2 + u.p.toolhead_homing_max - fed
+        self.log_info("Gate %d's filament was further back than its park position, "
+                      "feeding on to the toolhead sensor..." % gate)
+        extra = 0.
+        while extra < limit:
+            step = min(self.PARKED_FURTHER_STEP, limit - extra)
+            actual, homed, moved, _ = self.move_filament(
+                "Homing to toolhead sensor from further back", step,
+                motor="gear", homing_move=1, endstop_name=SENSOR_TOOLHEAD)
+            extra += actual
+            if homed:
+                self.log_debug("Gate %d reached the toolhead sensor %.1fmm further on" % (gate, extra))
+                return extra, True
+            if moved < step / 2:
+                break
+        return extra, False
 
 
     def _preload_to_toolhead_park(self, pending=None):
@@ -263,12 +307,15 @@ class MmuFilamentMovement:
             self.set_filament_direction(DIRECTION_LOAD)
             if toolhead_clear:
                 self.log_always("Preloading gate %d to the toolhead sensor..." % gate)
-                actual, homed, _, _ = self.move_filament(
+                actual, homed, measured, _ = self.move_filament(
                     "Preload homing to toolhead sensor",
                     feed_limit,
                     homing_move=1,
                     endstop_name=SENSOR_TOOLHEAD,
                 )
+                if not homed and parked:
+                    extra, homed = self._home_to_toolhead_from_further(gate, actual, measured)
+                    actual += extra
                 if not homed:
                     self.gate_maps.set_gate_status(gate, GATE_UNKNOWN)
                     self.set_filament_pos_state(FILAMENT_POS_UNKNOWN)
@@ -281,7 +328,8 @@ class MmuFilamentMovement:
                 self.move_filament("Parking above toolhead", -margin)
             else:
                 self.log_always("Preloading gate %d until it stops at the toolhead..." % gate)
-                self._feed_until_stalled(gate, feed_limit, at_stop_ok=parked)
+                self._feed_until_stalled(gate, feed_limit, at_stop_ok=parked,
+                                         further_limit=to_sensor * 1.2 + u.p.toolhead_homing_max)
                 self.move_filament("Parking above toolhead", -margin)
             self.set_filament_pos_state(FILAMENT_POS_UNLOADED)
 
@@ -2062,6 +2110,13 @@ class MmuFilamentMovement:
                         homing_move=1,
                         endstop_name=SENSOR_TOOLHEAD,
                     )
+
+                    # park_at_toolhead: a parked strand pulled back since its unload
+                    gate = self.gate_selected
+                    if (not fhomed and not extruder_only and gate >= 0
+                            and getattr(self, 'gate_parked_at_toolhead', [False] * self.num_gates)[gate]):
+                        extra, fhomed = self._home_to_toolhead_from_further(gate, actual, measured)
+                        actual += extra
 
                     if fhomed:
                         self.set_filament_pos_state(FILAMENT_POS_HOMED_TS)

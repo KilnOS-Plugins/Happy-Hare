@@ -116,6 +116,7 @@ class MmuCalibrateEncoderCommand(CalibrationMixin, BaseCommand):
     """
     Start: Assumes filament is loaded through encoder\n"
     End: Does not eject filament at end (filament same as start)\n"
+    park_at_toolhead: a parked strand is pulled back first and returned to its park after\n"
     """
 
     CMD = "MMU_CALIBRATE_ENCODER"
@@ -124,7 +125,7 @@ class MmuCalibrateEncoderCommand(CalibrationMixin, BaseCommand):
     HELP_PARAMS = (
         "%s: %s\n" % (CMD, HELP_BRIEF)
         + "UNIT     = #(int)|_name_ Specify unit by name, number (optional if single unit)\n"
-        + "LENGTH   = #(mm) Commanded distance (default: 400)\n"
+        + "LENGTH   = #(mm) Commanded distance (default: 400; 200 on a strand parked above the toolhead)\n"
         + "REPEATS  = #(count) Number of repetitions (default: 3, min: 1, max: 10)\n"
         + "SPEED    = #(mm/s) Move speed (default: gear_load_speed)\n"
         + "ACCEL    = #(mm/s^2) Move accel (default: gear_load_accel)\n"
@@ -165,20 +166,45 @@ class MmuCalibrateEncoderCommand(CalibrationMixin, BaseCommand):
             check_gates=[gate]
         ): return
 
-        length = gcmd.get_float('LENGTH', 400., above=0.)
+        advance = 60. # Ensure filament is in encoder even if not loaded by user
+
+        # park_at_toolhead (one bowden per gate up to a toolhead combiner): a parked strand
+        # sits a safety margin short of the toolhead, with no room for the forward moves. It is
+        # pulled back first, by everything the calibration feeds forward, and returned to its
+        # park after; the length is capped so its tip stays well past the encoder
+        parked = mmu_unit.p.park_at_toolhead and gate >= 0 and mmu.gate_parked_at_toolhead[gate]
+        if mmu_unit.p.park_at_toolhead and mmu.filament_pos != FILAMENT_POS_UNLOADED:
+            mmu.log_error("Unload the tool first (MMU_UNLOAD): the encoder is calibrated on a strand parked above the toolhead")
+            return
+        max_length = None
+        if parked:
+            park_from_gate = calibrator.get_bowden_length() - mmu_unit.p.toolhead_unload_safety_margin
+            max_length = park_from_gate - advance - 100.
+            if max_length < 50.:
+                mmu.log_error("Gate %d's bowden is too short to calibrate the encoder on a parked strand" % gate)
+                return
+
+        length = gcmd.get_float('LENGTH', 400. if max_length is None else min(200., max_length), above=0.)
+        if max_length is not None and length > max_length:
+            mmu.log_always("LENGTH limited to %.0fmm so the parked strand stays in the encoder" % max_length)
+            length = max_length
         repeats = gcmd.get_int('REPEATS', 3, minval=1, maxval=10)
         speed = gcmd.get_float('SPEED', mmu_unit.p.gear_load_speed, minval=10.)
         accel = gcmd.get_float('ACCEL', mmu_unit.p.gear_load_accel, minval=10.)
         min_speed = gcmd.get_float('MINSPEED', speed, above=0.)
         max_speed = gcmd.get_float('MAXSPEED', speed, above=0.)
         save = gcmd.get_int('SAVE', 1, minval=0, maxval=1)
-        advance = 60. # Ensure filament is in encoder even if not loaded by user
+        retreat = advance + length if parked else 0.
 
         try:
             mmu.calibrating = True
 
             with mmu.wrap_sync_gear_to_extruder():
                 with mmu.require_encoder():
+                    if retreat:
+                        mmu.log_always("Pulling gate %d's parked filament back %.0fmm to make room..." % (gate, retreat))
+                        mmu.move_filament("Making room for calibration", -retreat)
+
                     _,_,measured,_ = mmu.move_filament("Checking for filament", advance)
 
                     if measured < mmu_unit.encoder.movement_min():
@@ -186,6 +212,9 @@ class MmuCalibrateEncoderCommand(CalibrationMixin, BaseCommand):
 
                     self._calibrate_encoder(length, repeats, min_speed, max_speed, accel, save)
                     _,_,_,_ = mmu.move_filament("Parking filament", -advance)
+
+                    if retreat:
+                        mmu.move_filament("Returning filament to its park above the toolhead", retreat)
 
         except MmuError as ee:
             mmu.handle_mmu_error(ee)

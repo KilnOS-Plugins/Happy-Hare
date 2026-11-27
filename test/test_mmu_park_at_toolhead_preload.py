@@ -129,8 +129,9 @@ class ParkAtToolheadPreloadTestCase(unittest.TestCase):
         self.assertEqual(self.hh.errors, [])
         self.assertAlmostEqual(self.fil.tip[2], self.combiner - self.margin, places=1)
 
-    def test_a_parked_gate_feeds_at_most_the_margin_and_homing_distance(self):
-        """Already parked, it starts near the toolhead: no bowden-length feed past a missed stop."""
+    def test_a_parked_gate_still_moving_at_its_limit_feeds_on_to_the_bowden_limit(self):
+        """Parked, its stop is expected within margin + homing; still moving there, it was
+        further back, so it feeds on. A stop that never comes is an error at the bowden limit."""
         self.load_gate(0)
         self.hh.place_filament(2, position=TIP_AT_GATE)
         self.hh.run_gcode('MMU_PRELOAD GATE=2')
@@ -141,8 +142,106 @@ class ParkAtToolheadPreloadTestCase(unittest.TestCase):
         self.hh.run_gcode('MMU_PRELOAD GATE=2')
 
         self.assertTrue(any('did not stop at the toolhead' in e for e in self.hh.errors), self.hh.errors)
-        limit = self.margin + self.unit.p.toolhead_homing_max
+        limit = self.to_sensor * 1.2 + self.unit.p.toolhead_homing_max
+        self.assertGreater(self.fil.tip[2] - start, self.margin + self.unit.p.toolhead_homing_max)
         self.assertLessEqual(self.fil.tip[2] - start, limit + self.mmu.PRELOAD_STALL_STEP)
+
+    def test_a_parked_strand_pulled_back_while_another_is_loaded_is_fed_on_to_the_combiner(self):
+        self.load_gate(0)
+        self.hh.place_filament(2, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=2')
+        self.hh.place_filament(2, position=self.combiner - self.margin - 300.)   # pulled back by hand
+
+        self.hh.run_gcode('MMU_PRELOAD GATE=2')
+
+        self.assertEqual(self.hh.errors, [])
+        self.assertAlmostEqual(self.fil.tip[2], self.combiner - self.margin, places=1)
+        self.assertTrue(self.mmu.gate_parked_at_toolhead[2])
+
+    def test_a_parked_strand_pulled_back_is_preloaded_to_the_toolhead_sensor(self):
+        self.hh.place_filament(1, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=1')
+        self.hh.place_filament(1, position=self.park - 300.)    # pulled back by hand
+
+        self.hh.run_gcode('MMU_PRELOAD GATE=1')
+
+        self.assertEqual(self.hh.errors, [])
+        self.assertAlmostEqual(self.fil.tip[1], self.park, places=1)
+        self.assertTrue(self.mmu.gate_parked_at_toolhead[1])
+
+    def test_a_parked_strand_pulled_back_is_fed_on_when_it_loads(self):
+        """A tool change to a parked gate whose strand was pulled back since its unload."""
+        self.hh.place_filament(1, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=1')
+        self.hh.place_filament(1, position=self.park - 300.)
+        self.hh.heat_extruder(220)
+        self.fil.history.clear()
+
+        self.hh.run_gcode('MMU_SELECT GATE=1')
+        self.hh.run_gcode('MMU_LOAD')
+
+        self.assertEqual(self.hh.errors, [])
+        self.assertEqual(self.mmu.filament_pos, FILAMENT_POS_LOADED)
+        fed = sum(d for g, d, _r in self.fil.history if g == 1 and d > 0)
+        self.assertGreater(fed, 300., self.fil.history)
+
+    def test_a_parked_strand_that_did_not_move_is_not_fed_on(self):
+        """No movement at the wheel: stuck, not further back. Nothing more is fed."""
+        self.hh.place_filament(1, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=1')
+        self.hh.run_gcode('MMU_SELECT GATE=1')
+        self.fil.history.clear()
+
+        extra, homed = self.mmu._home_to_toolhead_from_further(1, 125., 0.)
+
+        self.assertEqual((extra, homed), (0., False))
+        self.assertEqual(self.fil.history, [])
+
+    def test_a_runout_of_a_parked_gate_that_is_not_selected_clears_its_parked_flag(self):
+        """Pulling an idle spool in a print: the next insert is fed from the gate, the whole way."""
+        self.hh.place_filament(1, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=1')
+        self.hh.run_gcode('MMU_SELECT GATE=0')
+        self.assertTrue(self.mmu.gate_parked_at_toolhead[1])
+        self.hh.place_filament(1, position=-100000.0)
+        self.mmu._enable_filament_monitoring()
+        self.hh.settle(1.0)
+
+        self.hh.run_gcode('__MMU_SENSOR_RUNOUT EVENTTIME=%.3f SENSOR=mmu_entry_1 GATE=1'
+                          % self.hh.reactor.monotonic())
+
+        self.assertFalse(self.mmu.gate_parked_at_toolhead[1])
+
+    def test_encoder_calibration_on_a_parked_strand_never_feeds_past_its_park(self):
+        self.hh.place_filament(1, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=1')
+        self.hh.run_gcode('MMU_SELECT GATE=1')
+        start = self.fil.tip[1]
+        tips = []
+        advance = self.fil.advance
+
+        def track(gate, delta, reason=''):
+            r = advance(gate, delta, reason)
+            if gate == 1:
+                tips.append(self.fil.tip[1])
+            return r
+        self.fil.advance = track
+
+        self.hh.run_gcode('MMU_CALIBRATE_ENCODER SAVE=0 REPEATS=1')
+
+        self.assertEqual(self.hh.errors, [])
+        self.assertTrue(tips, 'calibration did not move gate 1')
+        self.assertLessEqual(max(tips), start + 0.5)
+        self.assertLess(min(tips), start - 200.)
+        self.assertAlmostEqual(self.fil.tip[1], start, places=1)
+
+    def test_encoder_calibration_with_the_tool_loaded_is_refused(self):
+        self.load_gate(0)
+        self.fil.history.clear()
+
+        self.hh.run_gcode('MMU_CALIBRATE_ENCODER SAVE=0 REPEATS=1')
+
+        self.assertFalse(any(g == 0 for g, _d, _r in self.fil.history), self.fil.history)
 
     def test_a_parked_strand_already_at_the_stop_feeds_only_two_steps(self):
         """An earlier park that left the tip against the combiner: no grinding, it parks."""

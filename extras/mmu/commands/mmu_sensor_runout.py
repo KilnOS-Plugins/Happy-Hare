@@ -142,11 +142,14 @@ class MmuSensorRunoutCommand(BaseCommand):
                         )
 
                     # An idle lane emptying is normal (the user pulled the spool). The gate map
-                    # was updated above if it was an entry sensor; there is nothing else to do
+                    # was updated above if it was an entry sensor. Nor is anything left parked
+                    # in its bowden (park_at_toolhead): a strand put back is fed the whole way
                     elif sensor.startswith((SENSOR_ENTRY_PREFIX, SENSOR_EXIT_PREFIX)):
                         mmu.log_debug(
                             "Runout event on %s which is not the selected gate. Ignored" % raw_sensor
                         )
+                        if is_entry:
+                            mmu.set_gate_parked_at_toolhead(gate, False)
 
                     else:
                         mmu.log_assertion(
